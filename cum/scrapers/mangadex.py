@@ -4,116 +4,90 @@ from cum.scrapers.base import BaseChapter, BaseSeries, download_pool
 from functools import partial
 from mimetypes import guess_type
 from urllib.parse import urljoin, urlparse
-from time import sleep
-from random import randrange
 import concurrent.futures
 import re
 import requests
-import json
 
 
 class MangadexSeries(BaseSeries):
-    url_re = re.compile(
-        r'(?:https?://mangadex\.org)?/(?:manga|title)/([0-9]+)'
-    )
-    # TODO remove when there are properly spaced api calls
-    spam_failures = 0
+    """Scraper for mangadex.org.
+
+    Some examples of chapter info used by Mangadex (matched with `name_re`):
+        Vol. 2 Ch. 18 - Strange-flavored Ramen
+        Ch. 7 - Read Online
+        Vol. 01 Ch. 001-013 - Read Online
+        Vol. 2 Ch. 8 v2 - Read Online
+        Oneshot
+    """
+    url_re = re.compile(r'(?:https?://mangadex\.(?:org|com))?/[^/]+/([0-9]+)')
+    chapter_re = re.compile(r'Ch\. ?([A-Za-z0-9\.\-]*)(?: v[0-9]+)?(?: - (.*))')
 
     def __init__(self, url, **kwargs):
         super().__init__(url, **kwargs)
-        self._get_page(self.url)
+        id = self.url_re.match(self.url).group(1)
+        r = requests.get("https://mangadex.org/api/?id=%s&type=manga" % (id, ))
+        self.data = r.json()
         self.chapters = self.get_chapters()
 
-    def _get_page(self, url):
-        manga_id = re.search(self.url_re, url)
-        r = requests.get('https://mangadex.org/api/manga/' + manga_id.group(1))
-
-        # TODO FIXME replace with properly spaced api calls
-        #            This is a bad workaround for
-        #                '503 please stop spaming the site'
-        #            erros when making requests to /api/ urls quickly.
-        #            It may still break when 4 calls are done at the same time
-        sleep(randrange(0, 900) / 1000.0)
-        if r.status_code == 503 and self.spam_failures < 3:
-            # sleep 10-17 seconds to wait out the spam protection
-            # and make it less likely for all threads to hit at the same time
-            sleep(randrange(10000, 17000) / 1000.0)
-            self.spam_failures = self.spam_failures + 1
-            return self._get_page(url)
-        elif self.spam_failures >= 3:
-            print("Error: Mangadex server probably contacted too often\n")
-            print(r.text)
-            raise exceptions.ScrapingError("Mangadex spam error")
-
-        self.spam_failures = 0
-        self.json = json.loads(r.text)
-
     def get_chapters(self):
-        result_chapters = []
-        manga_name = self.name
-        chapters = self.json['chapter'] if self.json.get('chapter') else []
-        for c in chapters:
-            url = 'https://mangadex.org/chapter/' + c
-            chapter = chapters[c]['chapter']
-            title = chapters[c]['title'] if chapters[c]['title'] else None
-            language = chapters[c]['lang_code']
-            # TODO: Add an option to filter by language.
-            if language != 'gb':
+        chapters = []
+        
+        for chapter_id, d in self.data.get("chapter", {}).items():
+            if d["lang_code"] not in ("gb", "us"):
                 continue
-            groups = [chapters[c]['group_name']]
-
-            result = MangadexChapter(name=manga_name, alias=self.alias,
-                                     chapter=chapter,
-                                     url=url,
-                                     groups=groups, title=title)
-            result_chapters = [result] + result_chapters
-        return result_chapters
+            url = "https://mangadex.org/chapter/%s" % (chapter_id, )
+            chapter_no = d["chapter"]
+            if self.chapter_re.match(chapter_no):
+                chapter_no = self.chapter_re.match(chapter_no).group(1)
+            
+            c = MangadexChapter(url=url,
+                                name=self.name,
+                                alias=self.alias,
+                                chapter=chapter_no,
+                                groups=[ d["group_name"] ],
+                                title=d["title"].strip() or None)
+            chapters.append(c)
+        
+        return chapters
 
     @property
     def name(self):
-        return self.json['manga']['title']
+        return self.data["manga"]["title"]
 
 
 class MangadexChapter(BaseChapter):
-    # match /chapter/12345 and avoid urls like /chapter/1235/comments
     url_re = re.compile(
-        r'(?:https?://mangadex\.org)?/chapter/([0-9]+)'
-        r'(?:/[^a-zA-Z0-9]|/?$)'
-    )
+        r'(?:https?://mangadex\.(?:org|com))?/chapter/([0-9]+)')
     uses_pages = True
 
     @staticmethod
-    def _reader_get(url, page_index):
-        chapter_id = re.search(MangadexChapter.url_re, url)
-        api_url = "https://mangadex.org/api/chapter/" + chapter_id.group(1)
-        return requests.get(api_url)
+    def _reader_get(url, page_index=0):
+        # page_index is ignored, we can get all pages at once
+        id = MangadexChapter.url_re.match(url).group(1)
+        url = "https://mangadex.org/api/?id=%s&type=chapter" % (id,)
+        return requests.get(url)
 
     def available(self):
         self.r = self.reader_get(1)
-        if not len(self.r.text):
+        try:
+            return len(self.r.json()["page_array"]) > 0
+        except Exception as e:
             return False
-        elif self.r.status_code == 404:
-            return False
-        elif re.search(re.compile(r'Chapter #[0-9]+ does not exist.'),
-                       self.r.text):
-            return False
-        else:
-            return True
 
     def download(self):
         if getattr(self, 'r', None):
             r = self.r
         else:
             r = self.reader_get(1)
-
-        chapter_hash = self.json['hash']
-        pages = self.json['page_array']
+        
+        data = r.json()
+        chapter_hash = data["hash"]
+        server = data["server"]
+        if server.startswith("/data/"):
+            server = "https://mangadex.org" + server
+        pages = data["page_array"]
+        
         files = [None] * len(pages)
-        # This can be a mirror server or data path. Example:
-        # var server = 'https://s2.mangadex.org/'
-        # var server = '/data/'
-        mirror = self.json['server']
-        server = urljoin('https://mangadex.org', mirror)
         futures = []
         last_image = None
         with self.progress_bar(pages) as bar:
@@ -123,6 +97,7 @@ class MangadexChapter(BaseChapter):
                 else:
                     print('Unkown image type for url {}'.format(page))
                     raise ValueError
+                print ("#{#{}}", image)
                 r = requests.get(image, stream=True)
                 if r.status_code == 404:
                     r.close()
@@ -136,10 +111,9 @@ class MangadexChapter(BaseChapter):
             self.create_zip(files)
 
     def from_url(url):
-        r = MangadexChapter._reader_get(url, 1)
-        data = json.loads(r.text)
-        manga_id = data['manga_id']
-        series = MangadexSeries('https://mangadex.org/manga/' + str(manga_id))
+        r = MangadexChapter._reader_get(url)
+        series_url = "https://mangadex.org/title/%s" % (r.json()["manga_id"],)
+        series = MangadexSeries(series_url)
         for chapter in series.chapters:
             parsed_chapter_url = ''.join(urlparse(chapter.url)[1:])
             parsed_url = ''.join(urlparse(url)[1:])
@@ -147,6 +121,5 @@ class MangadexChapter(BaseChapter):
                 return chapter
 
     def reader_get(self, page_index):
-        r = self._reader_get(self.url, page_index)
-        self.json = json.loads(r.text)
-        return r
+        return self._reader_get(self.url, page_index)
+
